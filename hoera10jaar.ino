@@ -7,8 +7,14 @@
 #include <DNSServer.h>
 #include <HTTP_Method.h>
 #include <esp_task_wdt.h>
+#include "limits.h"
 
 #define Sprintf(f, ...) ({ char* s; asprintf(&s, f, __VA_ARGS__); String r = s; free(s); r; })
+
+// Set the following to your own MQTT server address and the topic where the badge should obtain its brightness
+// It takes brightness values 0-100, where 0 is nearly off and 100 is fully on.
+const char*  mqtt_server_domo       = "10.0.1.3";
+const char*  mqtt_topic_brightness  = "niek/lighting/brightness";
 
 const char*  mqtt_server = "hoera10jaar.revspace.nl";
 String       my_hostname = "decennium-";
@@ -30,17 +36,27 @@ int          fade_interval = 5;
 int          waitstep = 10;
 int          wait = -14 * waitstep;
 
+// Dimming additions
+const int levels_full[] = { 192,40,224,8,24,152,128,104,184,16,88,216,208,240,
+  176,232,200,32,160,72,248,80,56,112,136,0,48,144,168,64,96,120}; // ((0..31) »*» 8).pick(*).join(",")
+int *levels = (int*) levels_full;
+
+int levels_dim_1[32] = {0};
+int levels_dim_2[32] = {0};
+
+// Gamma correction
+const float gamma_c = 2.8; // recommended 1.5 - 3.0
 
 WiFiClient   espClient;
+WiFiClient   espClient_domo;
 PubSubClient mqtt(espClient);
+PubSubClient mqtt_domo(espClient_domo);
 
 //////// LED matrix
 
 
 // Highly optimized and tweaked
 void loop() {  // Pinned to core 1, nothing else is.
-  const static int levels[] = { 192,40,224,8,24,152,128,104,184,16,88,216,208,240,
-  176,232,200,32,160,72,248,80,56,112,136,0,48,144,168,64,96,120};  // ((0..31) »*» 8).pick(*).join(",")
   const uint32_t colgpio[numcols] = {  // calculate at compile time
     (uint32_t)1 << cols[0],
     (uint32_t)1 << cols[1],
@@ -125,6 +141,35 @@ bool fade() {
 
 void wait_fade() {
   while (fade());
+}
+
+void update_brightness(float brightness_percent) {
+  // Input brightness 0-100, internal brightness 0-255
+
+  uint8_t brightness = (uint8_t) (255.0 * pow(brightness_percent / 100.0, gamma_c) + 0.5);
+
+  Serial.println("Helderheid: ");
+  Serial.println(brightness_percent);
+  
+  // Brightness 0-255 where 0 means on at lowest brightness.
+  if (brightness >= 248) {
+    levels = (int*) levels_full;
+    return;
+  }
+  
+  // Double-buffered to reduce glitches
+  int* levels_next = levels_dim_1;
+  if (levels == levels_dim_1)
+    levels_next = levels_dim_2;
+
+  for (uint8_t i = 0; i < 32; i++) {
+    if (brightness >= levels_full[i])
+      levels_next[i] = levels_full[i];
+    else
+      levels_next[i] = INT_MAX;
+  }
+
+  levels = levels_next;
 }
 
 //////// Over-The-Air update
@@ -423,6 +468,16 @@ void callback(char* topic, byte* message, unsigned int length) {
   current[lednr + 15] += minus;
 }
 
+void callback_domo(char* topic, byte* p_message, unsigned int length) {
+  String message;
+  for (uint8_t i = 0; i < length; i++) {
+    message.concat((char)p_message[i]);
+  }
+
+  float newBrightness = constrain(message.toFloat(), 0.0, 100.0);
+  update_brightness(newBrightness);
+}
+
 void reconnect_mqtt() {
   // Als de wifi weg is, blijft dit hangen en grijpt de watchdog in.
   // WiFi.status() blijft echter op WL_CONNECTED dus slimmere afhandeling is lastig.
@@ -435,6 +490,18 @@ void reconnect_mqtt() {
       mqtt.subscribe("hoera10jaar/+");
     } else {
       Serial.printf("mislukt, rc=%d\n", mqtt.state());
+      all(5000, true, true);
+      all(1, false, false);
+    }
+  }
+
+  while (!mqtt_domo.connected()) {
+    Serial.print("Verbinden met MQTT-server (domo)...");
+    if (mqtt_domo.connect(my_hostname.c_str())) {
+      Serial.println("verbonden");
+      mqtt_domo.subscribe(mqtt_topic_brightness);
+    } else {
+      Serial.printf("mislukt, rc=%d\n", mqtt_domo.state());
       all(5000, true, true);
       all(1, false, false);
     }
@@ -452,6 +519,8 @@ void setup() {
   Serial.println("o hai");
   my_hostname += Sprintf("%12" PRIx64, ESP.getEfuseMac());
   Serial.println(my_hostname);
+
+  update_brightness(10.0); // Start at low brightness
 
   xTaskCreatePinnedToCore(
     network,      /* Function to implement the task */
@@ -473,12 +542,15 @@ void network(void * pvParameters) {
   setup_wifi();
   mqtt.setServer(mqtt_server, 1883);
   mqtt.setCallback(callback);
+  mqtt_domo.setServer(mqtt_server_domo, 1883);
+  mqtt_domo.setCallback(callback_domo);
 
   while (1) {
-    if (!mqtt.connected()) reconnect_mqtt();
+    if (!mqtt.connected() || !mqtt_domo.connected()) reconnect_mqtt();
     fade();
 
     mqtt.loop();
+    mqtt_domo.loop();
     ArduinoOTA.handle();
     check_button();
 
